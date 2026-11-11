@@ -1,0 +1,642 @@
+---
+title: "Turn restrictions on toy networks"
+subtitle: "How OpenTripPlanner, OSRM, GraphHopper and this project apply OSM turn restrictions"
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    code-summary: "Code"
+    toc: true
+    toc-depth: 3
+    fig-align: center
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: root-dir
+#| include: false
+# run the code from the repository root, like the scripts
+knitr::opts_knit$set(root.dir = "..")
+```
+
+```{r}
+#| label: setup
+#| code-fold: false
+source("checks/schematic_helpers.R")
+tt1 <- function(net) list(tt = rep(1, nrow(st_as_sf(net, "edges"))))
+none <- toy_restrictions(list(id = 9, restriction = "no_entry",
+                              from = 99, via = 99, to = 99, via_type = "node"))
+```
+
+## How to read the figures
+
+- **Road network** (primal graph): circles are junctions, arrows are directed
+  edges. A two-way street is two arrows, one per direction, driving on the
+  right.
+- **Line graph** (edge-based graph): each road edge becomes a vertex (a circle
+  at the middle of the edge) and each **turn** becomes an arrow between two
+  vertices, drawn through the junction where it happens. Dashed grey arrows
+  are U-turns.
+- Colours: <span style="color:#0072B2">**from**</span>,
+  <span style="color:#E69F00">**via**</span>,
+  <span style="color:#CC79A7">**to**</span>,
+  <span style="color:#009E73">**copy**</span> (a duplicated node, vertex or
+  edge) and <span style="color:#D55E00">**removed, forbidden or wrong**</span>
+  movements.
+- Line graphs are the output of `build_line_graph()` in `processing/line_graph.R`, run on
+  each toy network. OSRM's edge-based graph has the same structure, so it is
+  drawn with the same function. The OpenTripPlanner and GraphHopper steps are
+  reproduced from their source code for illustration.
+
+## 1. Turn restrictions in OSM
+
+An OSM turn restriction is a relation with a `from` way, a `to` way and a
+`via` member. The `via` is either a **node** (the junction where the turn
+happens) or one or more **ways** (the restriction covers a sequence of roads).
+
+```{r}
+#| label: toy-networks
+#| code-fold: false
+# Four-way junction: no_left_turn from the south arm onto the west arm
+cross <- toy_network(
+  nodes = data.frame(id = 1:5, x = c(0, 0, 1, 0, -1), y = c(0, 1, 0, -1, 0),
+                     label = c("C", "N", "E", "S", "W")),
+  links = data.frame(way = 11:14, a = c(4, 1, 1, 1), b = c(1, 2, 3, 5),
+                     oneway = FALSE, fwd = c("SC", "CN", "CE", "CW"),
+                     bwd = c("CS", "NC", "EC", "WC"))
+)
+r_left <- toy_restrictions(list(id = 1, restriction = "no_left_turn",
+                                from = 11, via = 1, to = 14, via_type = "node"))
+roles_left <- c(SC = "from", CW = "to")
+
+# Dual carriageway with a median crossover V: no_u_turn A -> V -> B.
+# Traffic from the side road X may still cross through V and go south on B.
+dual <- toy_network(
+  nodes = data.frame(id = 1:8,
+                     x = c(0, 0, 0, 0.9, 0.9, 0.9, -1, 1.9),
+                     y = c(-1.2, 0, 1.2, 1.2, 0, -1.2, 0, 0),
+                     label = c("a", "p", "n", "s", "q", "b", "w", "e")),
+  links = data.frame(
+    way = c(21, 22, 24, 25, 23, 26, 27),
+    a = c(1, 2, 4, 5, 2, 7, 5), b = c(2, 3, 5, 6, 5, 2, 8),
+    oneway = c(TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, FALSE),
+    fwd = c("A", "N", "S", "B", "V", "X", "Y"),
+    bwd = c(NA, NA, NA, NA, NA, "x", "y"))
+)
+r_uturn <- toy_restrictions(list(id = 1, restriction = "no_u_turn",
+                                 from = 21, via = 23, to = 25, via_type = "way"))
+roles_uturn <- c(A = "from", V = "via", B = "to")
+```
+
+```{r}
+#| label: osm-restrictions
+#| fig-width: 9
+#| fig-height: 4.4
+plot_primal(cross, "Via-node restriction", "no_left_turn: from SC, via node C, to CW",
+            roles = roles_left, node_roles = c(C = "via")) |
+  plot_primal(dual, "Via-way restriction", "no_u_turn: from A, via way V, to B",
+              roles = roles_uturn)
+```
+
+A via-node restriction bans a single turn. A via-way restriction bans a
+**sequence**: `A → V → B` is banned, but `X → V → B` is allowed, so no single
+turn can be deleted on its own.
+
+## 2. Graph structures
+
+The approaches differ first in which graph they store and which graph the
+search moves along. The same junction, with the `no_left_turn` from `SC` to
+`CW`, in the three structures:
+
+```{r}
+#| label: graph-structures
+#| fig-width: 10
+#| fig-height: 3.9
+n_nodes <- nrow(st_as_sf(cross, "nodes"))
+n_edges <- nrow(st_as_sf(cross, "edges"))
+lg_struct <- build_line_graph(toy_edges(cross), r_left, weights = tt1(cross))
+
+# GraphHopper: standing on SC, the turns out of it are read from the table
+gh_options <- data.frame(
+  from = "SC", to = c("CN", "CE", "CW", "CS"),
+  label = c("0", "0", "∞", "u"),
+  kind = c("allowed", "allowed", "forbidden", "forbidden")
+)
+
+plot_primal(cross, "a. Primal graph",
+            sprintf("stored by OTP and GraphHopper: %d junctions, %d edges",
+                    n_nodes, n_edges)) |
+  plot_turn_costs(cross, gh_options, "b. GraphHopper's search",
+                  "on edge SC, turn costs read from the table",
+                  roles = c(SC = "from")) |
+  plot_line_graph(cross, line_graph_sfnet(cross, lg_struct), "c. Line graph",
+                  sprintf("as built by this project: %d vertices, %d turns",
+                          nrow(lg_struct$vertices), nrow(lg_struct$turns)),
+                  highlight = roles_left)
+```
+
+- **Primal graph (a).** Junctions are vertices and road edges are edges. A
+  search that moves from junction to junction cannot tell a left turn from a
+  straight-on move, because it does not know which edge it arrived on. OTP
+  therefore writes turn restrictions into the graph by copying junction nodes
+  (§3), and checks U-turns in the search using the edge it came from.
+- **GraphHopper (b)** stores the primal graph, but with turn costs switched on
+  its search states are **edges**. Standing on `SC`, it reads the cost of each
+  turn out of `SC` from the turn-cost table: 0 for an allowed turn, ∞ for the
+  restricted one and the U-turn penalty `u` for going back. Moving from edge to
+  edge through turns is a search on the line graph, but GraphHopper never builds
+  that graph: it works out each edge's turns only when the search reaches it.
+- **Line graph (c).** OSRM and this project build the line graph before
+  routing: every directed road edge is a vertex and every allowed turn is an
+  edge. The restricted turn is simply missing, and the search needs no special
+  rules. (OSRM would leave out the four U-turns at `C`; see the U-turn rules
+  in §4 and §6.)
+
+The line graph is larger than the primal graph. For the Bogotá test polygon,
+4,491 junctions and 9,537 directed edges become 9,548 line-graph vertices
+(9,537 road edges plus 11 copies for via-way restrictions) and 22,939 turns
+(6,917 of them U-turns).
+
+## 3. OpenTripPlanner
+
+OTP routes on the **road network**. The search remembers the last edge it used,
+and refuses to drive straight back along the reverse of that edge, so U-turns
+are never allowed (not even at dead ends). Source:
+`TurnRestrictionModule`, `OsmDatabase.processRestriction`, `StreetEdge.doTraverse`.
+
+### Via-node restriction: copy the junction node
+
+OTP copies the via node (`C′`) and redirects the from-edge to it. The copy
+gets duplicates of every exit except the banned one. Everyone else still uses
+the original `C`.
+
+```{r}
+#| label: otp-split
+#| fig-width: 9
+#| fig-height: 4.4
+# Reproduces TurnRestrictionModule.processVertex() for a NO_TURN restriction
+otp_split <- function(net, from_lab, via_lab, to_lab, offset = c(0.3, -0.3)) {
+  n <- st_as_sf(net, "nodes")
+  e <- st_as_sf(net, "edges")
+  xy <- st_coordinates(n)
+  vi <- which(n$label == via_lab)
+  new_xy <- xy[vi, ] + offset
+  n2 <- rbind(n, st_sf(id = max(n$id) + 1, label = paste0(via_lab, "′"),
+                       geometry = st_sfc(st_point(new_xy))))
+  ni <- nrow(n2)
+  fi <- which(e$label == from_lab)
+  st_geometry(e)[fi] <- st_sfc(lane(xy[e$from[fi], ], new_xy, shift = 0))
+  e$to[fi] <- ni
+  out <- which(e$from == vi & e$label != to_lab)
+  copies <- e[out, ]
+  copies$label <- paste0(copies$label, "′")
+  copies$edge_id <- copies$label
+  copies$from <- ni
+  st_geometry(copies) <- st_sfc(lapply(copies$to, function(t) {
+    lane(new_xy, xy[t, ], shift = 0)
+  }))
+  e2 <- rbind(e, copies)
+  list(net = sfnetwork(n2, e2, directed = TRUE, force = TRUE),
+       copies = copies$label)
+}
+
+otp <- otp_split(cross, "SC", "C", "CW")
+plot_primal(cross, "a. Restriction", "no_left_turn: SC → C → CW",
+            roles = roles_left, node_roles = c(C = "via")) |
+  plot_primal(otp$net, "b. Copy C, redirect the from-edge",
+              "C′ has every exit of C except CW",
+              roles = c(roles_left, setNames(rep("copy", length(otp$copies)), otp$copies)),
+              node_roles = c(C = "via", "C′" = "copy"))
+```
+
+The copied U-turn `CS′` stays in the graph; the search refuses it.
+`only_*` restrictions work the same way, except the copy keeps only the
+allowed exit. When several restrictions share a junction, each one is also
+applied to copies made by earlier ones.
+
+### Via-way restriction: not supported
+
+OTP compares the `via` member with the **node ids** at the ends of the from-
+and to-edges. A via way's id never matches, so the restriction finds no edge
+and is dropped with a `TurnRestrictionBad: "No from edge found"` message. In
+the toy network above, OTP would allow `A → V → B`.
+
+## 4. OSRM
+
+OSRM builds an **edge-based graph** before routing: one vertex per road
+segment and one edge per allowed turn. This is the same idea as the line graph
+in this project. Source: `EdgeBasedGraphFactory`, `WayRestrictionMap`,
+`RestrictionGraph`, `intersection_analysis.cpp`.
+
+U-turns are only created at dead ends, at barriers and turning circles, where
+the junction has at most one two-way road or one allowed exit, and where a
+lane is tagged for U-turns. In the toy junction that keeps the four U-turns at
+the ends of the arms and none at `C`. The figures in this section use
+`build_line_graph(..., uturns = uturn_rules(junctions = FALSE))`, which applies
+the same rule.
+
+### Via-node restriction: the turn is never created
+
+```{r}
+#| label: osrm-node
+#| fig-width: 9
+#| fig-height: 4.2
+osrm_u <- uturn_rules(junctions = FALSE)
+lg_nou <- build_line_graph(toy_edges(cross), none, weights = tt1(cross),
+                           uturns = osrm_u)
+lg_left <- build_line_graph(toy_edges(cross), r_left, weights = tt1(cross),
+                            uturns = osrm_u)
+g_nou <- line_graph_sfnet(cross, lg_nou)
+plot_line_graph(cross, g_nou, "a. Edge-based graph", "turns allowed at each junction",
+                highlight = roles_left) |
+  plot_line_graph(cross, line_graph_sfnet(cross, lg_left), "b. With the restriction",
+                  "the turn SC → CW is not created",
+                  removed = removed_turns(g_nou, lg_left), highlight = roles_left)
+```
+
+For `only_*` restrictions, every other turn out of the from-segment is left
+out instead.
+
+### Via-way restriction: duplicate the via segment's vertex
+
+OSRM stores via-way restrictions in a **restriction graph**, a tree of
+restriction paths. Each step along a path gets a **duplicated edge-based
+node**. The from-segment turns onto the duplicate, and the duplicate has every
+turn of the original except the banned one.
+
+```{r}
+#| label: osrm-way
+#| fig-width: 9
+#| fig-height: 4
+lg_dual0 <- build_line_graph(toy_edges(dual), none, weights = tt1(dual),
+                             uturns = osrm_u)
+lg_dual <- build_line_graph(toy_edges(dual), r_uturn, weights = tt1(dual),
+                            uturns = osrm_u)
+g_dual0 <- line_graph_sfnet(dual, lg_dual0)
+plot_line_graph(dual, g_dual0, "a. Edge-based graph", highlight = roles_uturn) |
+  plot_line_graph(dual, line_graph_sfnet(dual, lg_dual), "b. Duplicated node V′",
+                  "A → V′ → Y only; X → V → B kept",
+                  removed = removed_turns(g_dual0, lg_dual), highlight = roles_uturn)
+```
+
+Restrictions that start with the same steps share the same duplicated nodes,
+because they share a branch of the restriction graph. Restrictions with
+several via ways get one duplicate per via segment.
+
+## 5. GraphHopper
+
+GraphHopper routes on the **road network**, but its search moves from edge to
+edge and pays a cost for every turn, read from a **turn-cost table** keyed by
+(in-edge, junction, out-edge). A forbidden turn has infinite cost. U-turns get
+a fixed penalty everywhere (`u_turn_costs`, for example 60 s), which can be set
+to infinite. `only_*` restrictions are converted into the equivalent `no_*`
+ones. Source: `RestrictionSetter`, `OSMRestrictionConverter`,
+`DefaultTurnCostProvider`.
+
+### Via-node restriction: infinite turn cost
+
+```{r}
+#| label: gh-node
+#| fig-width: 9
+#| fig-height: 4.4
+gh_node <- data.frame(from = "SC", to = "CW", label = "∞")
+plot_primal(cross, "a. Restriction", roles = roles_left, node_roles = c(C = "via")) |
+  plot_turn_costs(cross, gh_node, "b. Turn-cost table entry",
+                  "cost(SC, C, CW) = ∞", roles = roles_left,
+                  node_roles = c(C = "via"))
+```
+
+The network itself does not change: the restriction is one row in the turn-cost
+table.
+
+### Via-way restriction: an artificial copy of the via edge
+
+GraphHopper adds an **artificial edge** `V′`, a copy of `V` with the same
+geometry, to the road network. Two infinite turn costs then force traffic from
+`A` onto the copy and stop the copy from turning onto `B`.
+
+```{r}
+#| label: gh-way
+#| fig-width: 9
+#| fig-height: 4.4
+dual_gh <- add_edge_copy(dual, "V", "V′", shift = 0.32)
+gh_way <- data.frame(from = c("A", "V′"), to = c("V", "B"), label = "∞")
+roles_gh <- c(roles_uturn, "V′" = "copy")
+plot_primal(dual_gh, "a. Add the artificial edge V′",
+            "a copy of V in the road network", roles = roles_gh) |
+  plot_turn_costs(dual_gh, gh_way, "b. Two infinite turn costs",
+                  "A must use V′, and V′ cannot turn onto B",
+                  roles = roles_gh)
+```
+
+```{r}
+#| label: gh-table
+knitr::kable(data.frame(
+  `In-edge` = c("A", "V′", "any edge", "A"),
+  Junction = c("p", "q", "its end", "p"),
+  `Out-edge` = c("V", "B", "its reverse", "V′"),
+  Cost = c("∞", "∞", "u_turn_costs", "normal"),
+  Why = c("A is forced onto the copy", "the copy cannot continue to B",
+          "U-turns everywhere", "A → V′ → Y still allowed"),
+  check.names = FALSE
+))
+```
+
+GraphHopper creates one artificial edge per (in-edge, via-edge) pair, so
+overlapping restrictions that start from the same in-edge share it. Before
+that, it drops restrictions that contain another one (for example `A → V → B`
+is redundant if `A → V` is already forbidden). Other roads such as `X` may also
+turn onto `V′`; that does no harm because `V′` has the same exits as `V` minus
+`B`, and `V` itself is unchanged.
+
+## 6. This project: line graph with split vertices
+
+We build the line graph explicitly (`build_line_graph()`), like OSRM's
+edge-based graph, and run every search on it.
+
+### How this differs from OSRM
+
+The structure is the same as OSRM's: an edge-based graph built in advance,
+via-node restrictions as missing turns and via-way restrictions as duplicated
+vertices. The differences are in the details:
+
+| | OSRM | This project |
+|---|---|---|
+| Road segments | consecutive pieces of road between junctions are merged, also across OSM way boundaries when their attributes match | every OSM way is split at nodes shared with another way; pieces are never merged across ways |
+| Turn weight | weight of the segment being left + a turn penalty from the profile (angle, traffic signals, U-turns) | half the travel time of each edge + the same OSRM car-profile penalty (`osrm_turn_params()`; `turn_penalty = NULL` turns it off) |
+| Route ends | start and end points snapped to partial segments | whole edges |
+| U-turns | dead ends, barriers, turning circles, ≤ 1 two-way road, U-turn lanes | dead ends, turning facilities, and junctions of 3+ roads except signalised ones and motorways/trunk roads (`uturn_rules()`) |
+| Via-way restrictions | all built at once into a restriction graph; restrictions with a common start share one duplicate | applied one at a time with a search that finds copies; two restrictions from the same edge through the same via make a copy of a copy |
+| Conditional restrictions | can be applied (`restriction:conditional`) | skipped |
+| Search | contraction hierarchies or multi-level partitioning: milliseconds per query | plain Dijkstra (igraph, dodgr) |
+
+Routes are the same except for the U-turn rule and the first and last edge.
+The turn penalty follows OSRM's car profile: an angle term that only applies
+where more than two roads meet (≈ 0 s straight on, 2.1 s for a right turn,
+5.4 s for a left turn), 2 s per traffic signal (at the junction, or inside an
+edge in its direction of travel) and 20 s per U-turn (none at turning
+circles). On the Bogotá test area the penalties add a median of 13% to travel
+times, and change about half of the routes.
+
+Sharing copies between restrictions that start the same way, as
+OSRM and GraphHopper do, would make our line graph slightly smaller without
+changing any route.
+
+### Via-node restriction: U-turn rule, then delete the turn
+
+```{r}
+#| label: ours-node
+#| fig-width: 9
+#| fig-height: 7.6
+lg_all <- all_turns(cross)
+g_all <- line_graph_sfnet(cross, lg_all)
+lg_ours0 <- build_line_graph(toy_edges(cross), none, weights = tt1(cross))
+g_ours0 <- line_graph_sfnet(cross, lg_ours0)
+signal_C <- data.frame(node = 1, highway = "traffic_signals", direction = NA)
+lg_sig <- build_line_graph(toy_edges(cross), none, weights = tt1(cross),
+                           nodes = signal_C)
+lg_ours <- build_line_graph(toy_edges(cross), r_left, weights = tt1(cross))
+(plot_line_graph(cross, g_all, "a. All turns", "20 turns, 8 of them U-turns") |
+  plot_line_graph(cross, g_ours0, "b. U-turn rule",
+                  "dead ends and junction C (4 roads): all 8 kept",
+                  removed = removed_turns(g_all, lg_ours0))) /
+(plot_line_graph(cross, line_graph_sfnet(cross, lg_sig), "b′. If C had signals",
+                  "the 4 U-turns at C are not created",
+                  removed = removed_turns(g_all, lg_sig)) |
+  plot_line_graph(cross, line_graph_sfnet(cross, lg_ours), "c. Restriction applied",
+                  "turn SC → CW deleted",
+                  removed = removed_turns(g_ours0, lg_ours), highlight = roles_left))
+```
+
+A U-turn here means driving back along the same two-way road. `uturn_rules()`
+allows it:
+
+- at **dead ends** (the edge has no other exit),
+- at **turning circles, turning loops and mini-roundabouts**, without the 20 s
+  U-turn penalty,
+- at **junctions of three or more roads**, except at traffic signals (where
+  U-turns are usually not allowed or not practical) and on motorways and trunk
+  roads,
+- never in the middle of a road, where only two road pieces meet.
+
+`no_u_turn` relations are applied afterwards, so they remove U-turns that this
+rule would allow. Turning back on a divided road is not a U-turn in this sense:
+it is a normal sequence of turns through the median crossing, and via-way
+`no_u_turn` relations cover it. Every U-turn costs the OSRM penalty
+(7.45 s + 20 s). `uturn_rules(junctions = FALSE)` gives the stricter
+dead-end-only rule, and `at_signals = TRUE` allows U-turns at signalised
+junctions too. On the Bogotá test area, the default adds 5,967 U-turns at
+junctions and 17 at turning facilities to the 933 at dead ends. About one
+route in five becomes faster (median 13 s), and 0.7% more origin–destination
+pairs become reachable.
+
+`only_*` restrictions delete every other turn out of the from-edge at that
+node, U-turns included.
+
+### Via-way restriction: split the via vertex
+
+Deleting the turn `V → B` would also remove the legal `X → V → B` (**b**).
+Instead, `build_line_graph()` finds the sequence `A → V → B` and gives `A` its
+own copy of the via vertex, `V′`, with every exit of `V` except `B` (**c**).
+This is the same result as OSRM's duplicated node.
+
+```{r}
+#| label: ours-way
+#| fig-width: 10
+#| fig-height: 3.6
+lg_dual0_ours <- build_line_graph(toy_edges(dual), none, weights = tt1(dual))
+lg_dual_ours <- build_line_graph(toy_edges(dual), r_uturn, weights = tt1(dual))
+g_dual0_ours <- line_graph_sfnet(dual, lg_dual0_ours)
+wrong <- lg_dual0_ours
+wrong$turns <- wrong$turns[!(from == "V" & to == "B")]
+plot_line_graph(dual, g_dual0_ours, "a. Line graph", "U-turn rule applied",
+                highlight = roles_uturn) |
+  plot_line_graph(dual, line_graph_sfnet(dual, wrong), "b. Delete V → B?",
+                  "wrong: X → V → B is lost too",
+                  removed = removed_turns(g_dual0_ours, wrong), highlight = roles_uturn) |
+  plot_line_graph(dual, line_graph_sfnet(dual, lg_dual_ours), "c. Split V",
+                  "A → V′ → Y only",
+                  removed = removed_turns(g_dual0_ours, lg_dual_ours),
+                  highlight = roles_uturn)
+```
+
+### Overlapping restrictions
+
+Two restrictions in a chain, like relations 4297246 and 8868412 in Bogotá:
+**r1** bans `V → B → C` and **r2** bans `A → V → B`. The to-edge of r2 (`B`) is
+the via of r1, and the from-edge of r1 (`V`) is the via of r2.
+
+```{r}
+#| label: toy-chain
+chain <- toy_network(
+  nodes = data.frame(id = 1:8,
+                     x = c(-1, 0, 1, 1, 0, 2, 0, 2),
+                     y = c(0, 0, 0, 1, 1, 1, -1, 0),
+                     label = c("a", "p", "q", "s", "t", "u", "w", "e")),
+  links = data.frame(
+    way = 31:37,
+    a = c(1, 2, 3, 4, 4, 2, 3), b = c(2, 3, 4, 5, 6, 7, 8),
+    oneway = TRUE, fwd = c("A", "V", "B", "C", "D", "P", "Q"), bwd = NA)
+)
+r1 <- list(id = 1, restriction = "no_straight_on", from = 32, via = 33, to = 34, via_type = "way")
+r2 <- list(id = 2, restriction = "no_left_turn", from = 31, via = 32, to = 33, via_type = "way")
+```
+
+```{r}
+#| label: chain-steps
+#| fig-width: 9
+#| fig-height: 6.4
+lg_c0 <- build_line_graph(toy_edges(chain), none, weights = tt1(chain))
+lg_c1 <- build_line_graph(toy_edges(chain), toy_restrictions(r1), weights = tt1(chain))
+lg_c2 <- build_line_graph(toy_edges(chain), toy_restrictions(r1, r2), weights = tt1(chain))
+g_c0 <- line_graph_sfnet(chain, lg_c0)
+
+(plot_primal(chain, "a. r1", "V → B → C banned",
+             roles = c(V = "from", B = "via", C = "to")) |
+   plot_primal(chain, "b. r2", "A → V → B banned",
+               roles = c(A = "from", V = "via", B = "to"))) /
+  (plot_line_graph(chain, line_graph_sfnet(chain, lg_c1), "c. After r1",
+                   "V now enters the copy B′ (exit D only)",
+                   removed = removed_turns(g_c0, lg_c1),
+                   highlight = c(V = "from", B = "via", C = "to")) |
+     plot_line_graph(chain, line_graph_sfnet(chain, lg_c2), "d. After r2",
+                     "A enters V′, which has no exit to B or B′",
+                     removed = removed_turns(line_graph_sfnet(chain, lg_c1), lg_c2),
+                     highlight = c(A = "from", V = "via", B = "to")))
+```
+
+After r1, the turn `V → B` points to the copy `B′`. A search for r2's to-edge
+that only looks for the original `B` finds nothing, so r2 would be skipped and
+`A → V → B′` would stay drivable. This was the bug found in Bogotá. The search
+now matches vertices by road edge, finds `B′`, and r2 splits `V` into `V′`.
+Passes repeat until nothing changes, and every restriction gets a status:
+
+```{r}
+#| label: chain-status
+knitr::kable(lg_c2$report$way_via_status)
+```
+
+### Alternative considered: collapse the via way into one node
+
+Merging the crossover's ends `p` and `q` into one node `M` turns the restriction
+into a via-node one. Merging alone lets every entry reach every exit, so it
+**invents** movements that need `V` driven backwards (`V` is one-way from `p`
+to `q`). The merged node needs a turn table: the movements that were possible
+through `V`, minus the banned sequence. We kept vertex splitting because it is
+a smaller change and keeps `V` in the results.
+
+```{r}
+#| label: dual-collapse
+#| fig-width: 9
+#| fig-height: 4.4
+# Movements through the cluster {p, q}: naive merge vs. turn table
+collapse_movements <- function(net, lg_base, cluster_nodes, banned_seqs) {
+  e <- toy_edges(net)
+  internal <- e$edge_id[e$from %in% cluster_nodes & e$to %in% cluster_nodes]
+  entries <- e$edge_id[e$to %in% cluster_nodes & !e$edge_id %in% internal]
+  exits <- e$edge_id[e$from %in% cluster_nodes & !e$edge_id %in% internal]
+  out_by <- split(lg_base$turns$to, lg_base$turns$from)
+  paths <- function(a) {          # every path entry -> internal* -> exit
+    res <- list(); queue <- list(a)
+    while (length(queue)) {
+      p <- queue[[1]]; queue <- queue[-1]
+      for (nx in out_by[[p[length(p)]]]) {
+        if (nx %in% exits) res[[length(res) + 1]] <- c(p, nx)
+        if (nx %in% internal && !nx %in% p) queue[[length(queue) + 1]] <- c(p, nx)
+      }
+    }
+    res
+  }
+  banned <- function(p) any(vapply(banned_seqs, function(s) {
+    n <- length(s)
+    length(p) >= n && any(vapply(seq_len(length(p) - n + 1), function(i)
+      all(p[i:(i + n - 1)] == s), logical(1)))
+  }, logical(1)))
+  lk <- setNames(e$link_id, e$edge_id)
+  mv <- CJ(from = entries, to = exits)[lk[from] != lk[to]]
+  mv[, status := vapply(seq_len(.N), function(i) {
+    ps <- Filter(function(p) p[length(p)] == to[i], paths(from[i]))
+    if (!length(ps)) "invented by merge"
+    else if (all(vapply(ps, banned, logical(1)))) "banned"
+    else "allowed"
+  }, character(1))]
+  mv[, via := vapply(seq_len(.N), function(i) {
+    ps <- Filter(function(p) p[length(p)] == to[i], paths(from[i]))
+    if (length(ps)) paste(ps[[1]], collapse = " → ") else "—"
+  }, character(1))]
+  mv[]
+}
+
+mv <- collapse_movements(dual, lg_dual0, cluster_nodes = c(2, 5),
+                         banned_seqs = list(c("A", "V", "B")))
+
+# Draw the merged junction: p and q become one node M, V disappears
+merged_net <- function(net, cluster_nodes, label = "M") {
+  n <- st_as_sf(net, "nodes")
+  e <- st_as_sf(net, "edges")
+  xy <- st_coordinates(n)
+  m_xy <- colMeans(xy[n$id %in% cluster_nodes, , drop = FALSE])
+  keep <- !(e$from %in% which(n$id %in% cluster_nodes) &
+              e$to %in% which(n$id %in% cluster_nodes))
+  e <- e[keep, ]
+  ci <- which(n$id %in% cluster_nodes)
+  st_geometry(e) <- st_sfc(lapply(seq_len(nrow(e)), function(i) {
+    a <- if (e$from[i] %in% ci) m_xy else xy[e$from[i], ]
+    b <- if (e$to[i] %in% ci) m_xy else xy[e$to[i], ]
+    two <- any(e$link_id == e$link_id[i] & e$edge_id != e$edge_id[i])
+    lane(a, b, shift = if (two) 0.06 else 0)
+  }))
+  n2 <- n[-ci[-1], ]
+  st_geometry(n2)[n2$id == cluster_nodes[1]] <- st_sfc(st_point(m_xy))
+  n2$label[n2$id == cluster_nodes[1]] <- label
+  e$from <- match(n$id[e$from], n2$id); e$from[is.na(e$from)] <- which(n2$label == label)
+  e$to <- match(n$id[e$to], n2$id); e$to[is.na(e$to)] <- which(n2$label == label)
+  sfnetwork(n2, e, directed = TRUE, force = TRUE)
+}
+
+mnet <- merged_net(dual, c(2, 5))
+mv_lg <- list(
+  vertices = data.table(vertex_id = st_as_sf(mnet, "edges")$edge_id,
+                        edge_id = st_as_sf(mnet, "edges")$edge_id),
+  turns = mv[, .(from, to, turn_type = "turn")]
+)
+g_m <- line_graph_sfnet(mnet, mv_lg)
+gm_e <- st_as_sf(g_m, "edges")
+status_of <- setNames(mv$status, paste(mv$from, mv$to))
+gm_e$status <- status_of[paste(gm_e$from_id, gm_e$to_id)]
+g_table <- line_graph_sfnet(mnet, list(vertices = mv_lg$vertices,
+  turns = mv[status == "allowed", .(from, to, turn_type = "turn")]))
+
+plot_line_graph(mnet, g_m, "a. Merge p and q into M",
+                "every entry reaches every exit",
+                invented = gm_e[gm_e$status == "invented by merge", ],
+                removed = gm_e[gm_e$status == "banned", ],
+                highlight = c(A = "from", B = "to")) |
+  plot_line_graph(mnet, g_table, "b. Merge + turn table",
+                  "only movements possible through V, minus A → B",
+                  highlight = c(A = "from", B = "to"))
+```
+
+Solid orange arrows in **a** are movements that do not exist in the real
+network; the dashed one is the banned `A → V → B`.
+
+```{r}
+#| label: dual-turn-table
+knitr::kable(mv[order(status, from, to),
+                .(Movement = paste(from, "→", to), `Path in the real network` = via,
+                  Status = status)])
+```
+
+## Summary
+
+| | OpenTripPlanner | OSRM | GraphHopper | This project |
+|---|---|---|---|---|
+| Graph stored | primal (road network) | line graph (edge-based graph) | primal + turn-cost table | line graph |
+| Graph searched | primal; each step remembers the last edge | line graph | line graph, worked out during the search | line graph |
+| Via node | copy the junction node (§3) | turn not created (§4) | infinite turn cost (§5) | turn deleted (§6) |
+| Via way | not supported | duplicated edge-based node (§4) | artificial copy of the via edge + infinite turn costs (§5) | copy of the via vertex (§6) |
+| `only_*` | the copy keeps only the allowed exit | other turns not created | converted to equivalent `no_*` | other turns deleted; the copy keeps only the chain |
+| Overlapping restrictions | restrictions also applied to earlier copies | shared branches of the restriction graph | one artificial edge per (in-edge, via-edge) pair; redundant restrictions dropped | search finds copies; passes repeat until stable |
+| U-turns | never allowed | dead ends, barriers, turning circles, ≤ 1 two-way road, U-turn lanes | fixed penalty everywhere (e.g. 60 s, or infinite) | dead ends, turning facilities, unsignalised junctions (§6) |
