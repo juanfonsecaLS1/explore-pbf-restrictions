@@ -29,6 +29,7 @@ checks/       checks and results
   01_routability_checks.R -> outputs/routability_examples.gpkg
   02_buffer_check.R       -> layer cut_off_with_buffer
   03_plot_routes.R        -> outputs/route_plots/*.png
+  04_network_size.R       primal vs line graph size -> outputs/network_size.*
   turn_restriction_schematics.qmd  how OTP, OSRM, GraphHopper and this
                           project apply restrictions, on toy networks
 data/         study polygon (bogota_poly.geojson)
@@ -55,6 +56,7 @@ Rscript processing/01_build_network.R
 Rscript checks/01_routability_checks.R
 Rscript checks/02_buffer_check.R
 Rscript checks/03_plot_routes.R
+Rscript checks/04_network_size.R
 quarto render checks/turn_restriction_schematics.qmd
 ```
 
